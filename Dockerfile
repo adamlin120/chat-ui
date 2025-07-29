@@ -1,107 +1,39 @@
-# syntax=docker/dockerfile:1
-ARG INCLUDE_DB=false
+FROM node:18-alpine AS builder
 
-FROM node:20-slim AS base
-ENV PLAYWRIGHT_SKIP_BROWSER_GC=1
+WORKDIR /app
+COPY package*.json ./
+RUN npm ci
 
-# install dotenv-cli
-RUN npm install -g dotenv-cli
+COPY . .
+RUN npm run build
 
-# switch to a user that works for spaces
-RUN userdel -r node
-RUN useradd -m -u 1000 user
-USER user
-
-ENV HOME=/home/user \
-    PATH=/home/user/.local/bin:$PATH
+FROM node:18-alpine AS runner
 
 WORKDIR /app
 
-# add a .env.local if the user doesn't bind a volume to it
-RUN touch /app/.env.local
+# Install curl for health checks
+RUN apk add --no-cache curl
 
+# Install production dependencies
+COPY package*.json ./
+RUN npm ci --production && npm cache clean --force
 
-RUN npm i --no-package-lock --no-save playwright@1.52.0
+# Copy built application
+COPY --from=builder /app/build ./build
+COPY --from=builder /app/package.json ./
 
-USER root
+# Create non-root user
+RUN addgroup -g 1001 -S nodejs
+RUN adduser -S sveltekit -u 1001
+USER sveltekit
 
-RUN mkdir -p /data/models
-RUN chown -R 1000:1000 /data/models
+EXPOSE 3000
 
-RUN apt-get update
-RUN apt-get install gnupg curl git cmake clang libgomp1 -y
+ENV NODE_ENV=production
+ENV PORT=3000
 
-RUN npx playwright install --with-deps chromium
+# Health check
+HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
+  CMD curl -f http://localhost:3000/health || exit 1
 
-RUN chown -R 1000:1000 /home/user/.npm
-
-USER user
-
-
-COPY --chown=1000 .env /app/.env
-COPY --chown=1000 entrypoint.sh /app/entrypoint.sh
-COPY --chown=1000 gcp-*.json /app/
-COPY --chown=1000 package.json /app/package.json
-COPY --chown=1000 package-lock.json /app/package-lock.json
-
-RUN chmod +x /app/entrypoint.sh
-
-FROM node:20 AS builder
-
-WORKDIR /app
-
-COPY --link --chown=1000 package-lock.json package.json ./
-
-ARG APP_BASE=
-ARG PUBLIC_APP_COLOR=blue
-ARG SKIP_LLAMA_CPP_BUILD
-ENV BODY_SIZE_LIMIT=15728640
-ENV SKIP_LLAMA_CPP_BUILD=$SKIP_LLAMA_CPP_BUILD
-
-RUN --mount=type=cache,target=/app/.npm \
-    npm set cache /app/.npm && \
-    npm ci
-
-COPY --link --chown=1000 . .
-
-RUN git config --global --add safe.directory /app && \
-    npm run build
-
-# mongo image
-FROM mongo:7 AS mongo
-
-# image to be used if INCLUDE_DB is false
-FROM base AS local_db_false
-
-# image to be used if INCLUDE_DB is true
-FROM base AS local_db_true
-
-# copy mongo from the other stage
-COPY --from=mongo /usr/bin/mongo* /usr/bin/
-
-ENV MONGODB_URL=mongodb://localhost:27017
-USER root
-RUN mkdir -p /data/db
-RUN chown -R 1000:1000 /data/db
-USER user
-# final image
-FROM local_db_${INCLUDE_DB} AS final
-
-# build arg to determine if the database should be included
-ARG INCLUDE_DB=false
-ENV INCLUDE_DB=${INCLUDE_DB}
-
-# svelte requires APP_BASE at build time so it must be passed as a build arg
-ARG APP_BASE=
-# tailwind requires the primary theme to be known at build time so it must be passed as a build arg
-ARG PUBLIC_APP_COLOR=blue
-ARG PUBLIC_COMMIT_SHA=
-ENV PUBLIC_COMMIT_SHA=${PUBLIC_COMMIT_SHA}
-ENV BODY_SIZE_LIMIT=15728640
-ENV MODELS_STORAGE_PATH=/data/models
-
-#import the build & dependencies
-COPY --from=builder --chown=1000 /app/build /app/build
-COPY --from=builder --chown=1000 /app/node_modules /app/node_modules
-
-CMD ["/bin/bash", "-c", "/app/entrypoint.sh"]
+CMD ["node", "build"]
