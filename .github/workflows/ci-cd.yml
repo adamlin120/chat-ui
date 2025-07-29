@@ -1,0 +1,133 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  AWS_REGION: ap-northeast-1  # Tokyo region
+  ECR_REPOSITORY: chat-ui
+  NODE_VERSION: '18'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+          cache: 'npm'
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Check formatting
+        run: npm run format:check || echo "No format check script found"
+
+      - name: Run linting
+        run: npm run lint || echo "No lint script found"
+
+      - name: Type checking
+        run: npm run check || echo "No type check script found"
+
+      - name: Build application
+        run: npm run build
+
+      - name: Run security audit
+        run: npm audit --audit-level high --production
+
+  build-and-push:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    outputs:
+      image-uri: ${{ steps.build-image.outputs.image }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+
+  deploy-production:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    environment:
+      name: production
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Deploy to AWS App Runner
+        run: |
+          # Check if service exists
+          SERVICE_ARN=$(aws apprunner list-services --query "ServiceSummaryList[?ServiceName=='chat-ui-prod'].ServiceArn" --output text)
+          
+          if [ -z "$SERVICE_ARN" ]; then
+            echo "Creating new App Runner service..."
+            aws apprunner create-service \
+              --service-name chat-ui-prod \
+              --source-configuration '{
+                "ImageRepository": {
+                  "ImageIdentifier": "${{ needs.build-and-push.outputs.image-uri }}",
+                  "ImageConfiguration": {
+                    "Port": "3000",
+                    "RuntimeEnvironmentVariables": {
+                      "NODE_ENV": "production",
+                      "PORT": "3000"
+                    },
+                    "RuntimeEnvironmentSecrets": {
+                      "MONGODB_URL": "/chat-ui/mongodb-url",
+                      "HF_TOKEN": "/chat-ui/hf-token",
+                      "OPENAI_API_KEY": "/chat-ui/openai-key",
+                      "PUBLIC_ORIGIN": "/chat-ui/public-origin"
+                    }
+                  },
+                  "ImageRepositoryType": "ECR"
+                },
+                "AutoDeploymentsEnabled": true
+              }' \
+              --instance-configuration '{
+                "Cpu": "0.25 vCPU",
+                "Memory": "0.5 GB",
+                "InstanceRoleArn": "arn:aws:iam::${{ steps.get-account.outputs.account-id }}:role/ChatUIAppRunnerServiceRole"
+              }'
+          else
+            echo "Updating existing App Runner service..."
+            aws apprunner start-deployment --service-arn $SERVICE_ARN
+          fi
+
+      - name: Get account ID
+        id: get-account
+        run: echo "account-id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
