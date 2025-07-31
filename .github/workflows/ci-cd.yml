@@ -80,7 +80,7 @@ jobs:
     if: github.ref == 'refs/heads/main'
     environment:
       name: production
-    
+
     steps:
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@v4
@@ -89,45 +89,107 @@ jobs:
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
           aws-region: ${{ env.AWS_REGION }}
 
-      - name: Deploy to AWS App Runner
-        run: |
-          # Check if service exists
-          SERVICE_ARN=$(aws apprunner list-services --query "ServiceSummaryList[?ServiceName=='chat-ui-prod'].ServiceArn" --output text)
-          
-          if [ -z "$SERVICE_ARN" ]; then
-            echo "Creating new App Runner service..."
-            aws apprunner create-service \
-              --service-name chat-ui-prod \
-              --source-configuration '{
-                "ImageRepository": {
-                  "ImageIdentifier": "${{ needs.build-and-push.outputs.image-uri }}",
-                  "ImageConfiguration": {
-                    "Port": "3000",
-                    "RuntimeEnvironmentVariables": {
-                      "NODE_ENV": "production",
-                      "PORT": "3000"
-                    },
-                    "RuntimeEnvironmentSecrets": {
-                      "MONGODB_URL": "/chat-ui/mongodb-url",
-                      "HF_TOKEN": "/chat-ui/hf-token",
-                      "OPENAI_API_KEY": "/chat-ui/openai-key",
-                      "PUBLIC_ORIGIN": "/chat-ui/public-origin"
-                    }
-                  },
-                  "ImageRepositoryType": "ECR"
-                },
-                "AutoDeploymentsEnabled": true
-              }' \
-              --instance-configuration '{
-                "Cpu": "0.25 vCPU",
-                "Memory": "0.5 GB",
-                "InstanceRoleArn": "arn:aws:iam::${{ steps.get-account.outputs.account-id }}:role/ChatUIAppRunnerServiceRole"
-              }'
-          else
-            echo "Updating existing App Runner service..."
-            aws apprunner start-deployment --service-arn $SERVICE_ARN
-          fi
-
       - name: Get account ID
         id: get-account
-        run: echo "account-id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+        run: echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Ensure App Runner roles exist (AccessRole + InstanceRole)
+        env:
+          ACCOUNT_ID: ${{ steps.get-account.outputs.account_id }}
+        run: |
+          set -euo pipefail
+          ACCESS_ROLE_NAME="AppRunnerECRAccessRole"
+          INSTANCE_ROLE_NAME="ChatUIAppRunnerServiceRole"
+
+          # Access Role: for App Runner to pull from ECR (trust = build.apprunner.amazonaws.com)
+          if ! aws iam get-role --role-name "$ACCESS_ROLE_NAME" >/dev/null 2>&1; then
+            aws iam create-role --role-name "$ACCESS_ROLE_NAME" \
+              --assume-role-policy-document '{
+                "Version":"2012-10-17",
+                "Statement":[{"Effect":"Allow","Principal":{"Service":"build.apprunner.amazonaws.com"},"Action":"sts:AssumeRole"}]
+              }'
+            aws iam attach-role-policy --role-name "$ACCESS_ROLE_NAME" \
+              --policy-arn arn:aws:iam::aws:policy/service-role/AWSAppRunnerServicePolicyForECRAccess
+          fi
+
+          # Instance Role: runtime 權限（trust = tasks.apprunner.amazonaws.com）
+          if ! aws iam get-role --role-name "$INSTANCE_ROLE_NAME" >/dev/null 2>&1; then
+            aws iam create-role --role-name "$INSTANCE_ROLE_NAME" \
+              --assume-role-policy-document '{
+                "Version":"2012-10-17",
+                "Statement":[{"Effect":"Allow","Principal":{"Service":"tasks.apprunner.amazonaws.com"},"Action":"sts:AssumeRole"}]
+              }'
+            # 這裡先給範例最小集讀取權限，依你實際用到的 SSM/Secrets ARN 再收斂
+            cat > /tmp/instance-inline.json <<'POLICY'
+            {
+              "Version": "2012-10-17",
+              "Statement": [
+                {
+                  "Sid": "ReadSecretsManager",
+                  "Effect": "Allow",
+                  "Action": ["secretsmanager:GetSecretValue"],
+                  "Resource": [
+                    "arn:aws:secretsmanager:ap-northeast-1:*:secret:chat-ui/*"
+                  ]
+                },
+                {
+                  "Sid": "ReadSSMParams",
+                  "Effect": "Allow",
+                  "Action": ["ssm:GetParameter","ssm:GetParameters","ssm:GetParametersByPath"],
+                  "Resource": [
+                    "arn:aws:ssm:ap-northeast-1:*:parameter/chat-ui/*"
+                  ]
+                }
+              ]
+            }
+            POLICY
+            aws iam put-role-policy --role-name "$INSTANCE_ROLE_NAME" --policy-name ChatUIAppRunnerRuntimeAccess --policy-document file:///tmp/instance-inline.json
+          fi
+
+      - name: Deploy to AWS App Runner
+        env:
+          ACCOUNT_ID: ${{ steps.get-account.outputs.account_id }}
+          IMAGE_URI: ${{ needs.build-and-push.outputs.image-uri }}
+        run: |
+          set -euo pipefail
+          SERVICE_NAME="chat-ui-prod"
+          SERVICE_ARN=$(aws apprunner list-services --query "ServiceSummaryList[?ServiceName=='${SERVICE_NAME}'].ServiceArn" --output text)
+
+          ACCESS_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/AppRunnerECRAccessRole"
+          INSTANCE_ROLE_ARN="arn:aws:iam::${ACCOUNT_ID}:role/ChatUIAppRunnerServiceRole"
+
+          if [ -z "$SERVICE_ARN" ] || [ "$SERVICE_ARN" = "None" ]; then
+            echo "Creating new App Runner service..."
+            aws apprunner create-service \
+              --service-name "${SERVICE_NAME}" \
+              --source-configuration "{
+                \"ImageRepository\": {
+                  \"ImageIdentifier\": \"${IMAGE_URI}\",
+                  \"ImageRepositoryType\": \"ECR\",
+                  \"ImageConfiguration\": {
+                    \"Port\": \"3000\",
+                    \"RuntimeEnvironmentVariables\": {
+                      \"NODE_ENV\": \"production\"
+                    },
+                    \"RuntimeEnvironmentSecrets\": {
+                      \"MONGODB_URL\": \"arn:aws:ssm:ap-northeast-1:${ACCOUNT_ID}:parameter/chat-ui/mongodb-url\",
+                      \"HF_TOKEN\": \"arn:aws:ssm:ap-northeast-1:${ACCOUNT_ID}:parameter/chat-ui/hf-token\",
+                      \"OPENAI_API_KEY\": \"arn:aws:ssm:ap-northeast-1:${ACCOUNT_ID}:parameter/chat-ui/openai-key\",
+                      \"PUBLIC_ORIGIN\": \"arn:aws:ssm:ap-northeast-1:${ACCOUNT_ID}:parameter/chat-ui/public-origin\"
+                    }
+                  }
+                },
+                \"AuthenticationConfiguration\": {
+                  \"AccessRoleArn\": \"${ACCESS_ROLE_ARN}\"
+                },
+                \"AutoDeploymentsEnabled\": true
+              }" \
+              --instance-configuration "{
+                \"Cpu\": \"0.25 vCPU\",
+                \"Memory\": \"0.5 GB\",
+                \"InstanceRoleArn\": \"${INSTANCE_ROLE_ARN}\"
+              }"
+          else
+            echo "Updating existing App Runner service..."
+            aws apprunner start-deployment --service-arn "$SERVICE_ARN"
+          fi
