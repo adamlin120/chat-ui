@@ -1,45 +1,53 @@
-FROM node:22-alpine AS builder
-
+# ---------- Builder ----------
+FROM node:22-bookworm-slim AS builder
 WORKDIR /app
-# 新增：git / make / g++ / cmake / python3，並裝 libc6-compat 以避免常見的 GLIBC 相容性問題
-RUN apk add --no-cache git make g++ cmake python3 libc6-compat
 
-COPY package*.json ./
+# 安裝編譯工具與常用套件（供 node-llama-cpp / onnxruntime 等原生模組使用）
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    git build-essential cmake python3 ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
 
-# 建議關掉 husky 等 git hook（容器內通常沒有 .git）
+# 避免容器內 husky 嘗試找 .git
 ENV HUSKY=0
+
+# 先安裝依賴（利用快取）
+COPY package*.json ./
 RUN npm ci
 
+# 複製其餘程式碼並建置
 COPY . .
 RUN npm run build
 
-FROM node:22-alpine AS runner
 
+# ---------- Runner ----------
+FROM node:22-bookworm-slim AS runner
 WORKDIR /app
 
-# Install curl for health checks
-RUN apk add --no-cache curl
+# 健康檢查工具
+RUN apt-get update && apt-get install -y --no-install-recommends curl \
+ && rm -rf /var/lib/apt/lists/*
 
-# Install production dependencies
+# 僅安裝 production 依賴
 COPY package*.json ./
-RUN npm ci --production && npm cache clean --force
+ENV HUSKY=0
+RUN npm ci --omit=dev && npm cache clean --force
 
-# Copy built application
+# 複製建置產物與必要檔案
 COPY --from=builder /app/build ./build
 COPY --from=builder /app/package.json ./
 
-# Create non-root user
-RUN addgroup -g 1001 -S nodejs
-RUN adduser -S sveltekit -u 1001
+# 非 root 執行
+RUN groupadd -g 1001 nodejs && useradd -m -u 1001 -g 1001 sveltekit
 USER sveltekit
 
-EXPOSE 3000
-
+# 環境變數與埠號
 ENV NODE_ENV=production
 ENV PORT=3000
+EXPOSE 3000
 
-# Health check
+# 健康檢查
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
   CMD curl -f http://localhost:3000/health || exit 1
 
-CMD ["node", "build"]
+# SvelteKit adapter-node 的進入點
+CMD ["node", "build/index.js"]
