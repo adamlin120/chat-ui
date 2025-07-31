@@ -1,7 +1,13 @@
 FROM node:22-alpine AS builder
 
 WORKDIR /app
+# 新增：git / make / g++ / cmake / python3，並裝 libc6-compat 以避免常見的 GLIBC 相容性問題
+RUN apk add --no-cache git make g++ cmake python3 libc6-compat
+
 COPY package*.json ./
+
+# 建議關掉 husky 等 git hook（容器內通常沒有 .git）
+ENV HUSKY=0
 RUN npm ci
 
 COPY . .
